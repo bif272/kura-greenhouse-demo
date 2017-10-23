@@ -8,8 +8,8 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
-import org.eclipse.iot.greenhouse.sensors.SensorService;
 import org.eclipse.iot.greenhouse.sensors.SensorChangedListener;
+import org.eclipse.iot.greenhouse.sensors.SensorService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -23,153 +23,209 @@ import com.pi4j.io.i2c.I2CDevice;
 import com.pi4j.io.i2c.I2CFactory;
 
 public class Pi4JGreenhouseSensorService implements SensorService {
-	private static final Logger s_logger = LoggerFactory
-			.getLogger(Pi4JGreenhouseSensorService.class);
 
-	private List<SensorChangedListener> _listeners = new CopyOnWriteArrayList<SensorChangedListener>();
-	private I2CBus _i2cbus;
-	private I2CDevice _temperatureSensor;
-	private GpioController _gpioController;
-	private GpioPinDigitalMultipurpose _lightActuator;
+    private static final Logger s_logger = LoggerFactory.getLogger(Pi4JGreenhouseSensorService.class);
 
-	private float _temperatureRef = Float.MIN_VALUE;
+    private List<SensorChangedListener> _listeners = new CopyOnWriteArrayList<SensorChangedListener>();
+    private I2CBus _i2cbus;
+    private I2CDevice _temperatureSensor;
+    private I2CDevice _umiditySensor;
+    private GpioController _gpioController;
+    private GpioPinDigitalMultipurpose _lightActuator;
 
-	private ScheduledThreadPoolExecutor _scheduledThreadPoolExecutor;
-	private ScheduledFuture<?> _handle;
+    private float _temperatureRef = Float.MIN_VALUE;
+    private float _umidityRef = Float.MIN_VALUE;
 
-	protected void activate() {
-		try {
-			_gpioController = GpioFactory.getInstance();
-			_i2cbus = I2CFactory.getInstance(I2CBus.BUS_1);
+    private ScheduledThreadPoolExecutor _scheduledThreadPoolExecutor;
+    private ScheduledThreadPoolExecutor _scheduledThreadPoolExecutorUmidity;
+    private ScheduledFuture<?> _handle;
+    private ScheduledFuture<?> _handleUmidity;
 
-			_temperatureSensor = _i2cbus.getDevice(0x40);
-			_lightActuator = _gpioController.provisionDigitalMultipurposePin(
-					RaspiPin.GPIO_00, "led", PinMode.DIGITAL_OUTPUT);
-			_lightActuator.setShutdownOptions(true); // unexport on shutdown
+    protected void activate() {
+        try {
+            _gpioController = GpioFactory.getInstance();
+            _i2cbus = I2CFactory.getInstance(I2CBus.BUS_1);
 
-			// monitor temperature changes
-			// every change of more than 0.1C will notify SensorChangedListeners
-			_scheduledThreadPoolExecutor = new ScheduledThreadPoolExecutor(1);
-			_handle = _scheduledThreadPoolExecutor.scheduleAtFixedRate(
-					new Runnable() {
-						@Override
-						public void run() {
-							try {
-								float newTemperature = readTemperature();
-								if (Math.abs(_temperatureRef - newTemperature) > .1f) {
-									notifyListeners("temperature",
-											newTemperature);
-									_temperatureRef = newTemperature;
-								}
-							} catch (IOException e) {
-								// TODO Auto-generated catch block
-								e.printStackTrace();
-							}
-						}
-					}, 0, 100, TimeUnit.MILLISECONDS);
+            _temperatureSensor = _i2cbus.getDevice(0x40);
+            _umiditySensor = _i2cbus.getDevice(0x40);
+            _lightActuator = _gpioController.provisionDigitalMultipurposePin(RaspiPin.GPIO_00, "led",
+                    PinMode.DIGITAL_OUTPUT);
+            _lightActuator.setShutdownOptions(true); // unexport on shutdown
 
-		} catch (IOException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
-	}
+            // monitor temperature changes
+            // every change of more than 0.1C will notify SensorChangedListeners
+            _scheduledThreadPoolExecutor = new ScheduledThreadPoolExecutor(1);
+            _handle = _scheduledThreadPoolExecutor.scheduleAtFixedRate(new Runnable() {
 
-	protected void deactivate() {
-		s_logger.info("Deactivating Pi4JGreenhouseSensorService...");
+                @Override
+                public void run() {
+                    try {
+                        float newTemperature = readTemperature();
+                        if (Math.abs(_temperatureRef - newTemperature) > .1f) {
+                            notifyListeners("temperature", newTemperature);
+                            _temperatureRef = newTemperature;
+                        }
+                        if (_temperatureRef > 23f) {
+                            notifyListeners("actuators", "light");
+                        }
+                    } catch (IOException e) {
+                        s_logger.error(e.getMessage());
+                    }
+                }
+            }, 0, 100, TimeUnit.MILLISECONDS);
 
-		if (_gpioController != null) {
-			s_logger.info("... unexport all GPIOs");
-			_gpioController.unexportAll();
-			s_logger.info("... shutdown");
-			_gpioController.shutdown();
-			s_logger.info("... DONE.");
-		}
+            // monitor umidity changes
+            _scheduledThreadPoolExecutorUmidity = new ScheduledThreadPoolExecutor(1);
+            _handleUmidity = _scheduledThreadPoolExecutorUmidity.scheduleAtFixedRate(new Runnable() {
 
-		if (_handle != null) {
-			_handle.cancel(true);
-		}
+                @Override
+                public void run() {
+                    try {
+                        float newUmidity = readUmidity();
+                        if (Math.abs(_umidityRef - newUmidity) > .9f) {
+                            notifyListeners("umidity", newUmidity);
+                            _umidityRef = newUmidity;
+                        }
+                    } catch (IOException e) {
+                        s_logger.error(e.getMessage());
+                    }
+                }
+            }, 0, 100, TimeUnit.MILLISECONDS);
 
-		s_logger.info("Deactivating Pi4JGreenhouseSensorService... Done.");
-	}
+        } catch (IOException e) {
+            s_logger.error(e.getMessage());
+        }
 
-	@Override
-	public Object getSensorValue(String sensorName)
-			throws NoSuchSensorOrActuatorException {
-		if ("temperature".equals(sensorName)) {
-			try {
-				return readTemperature();
-			} catch (IOException e) {
-				return new NoSuchSensorOrActuatorException();
-			}
-		} else if ("light".equals(sensorName)) {
-			return readLightState();
-		} else
-			throw new SensorService.NoSuchSensorOrActuatorException();
-	}
+    }
 
-	/*
-	 * See sensor documentation here:
-	 * http://www.hoperf.cn/upload/sensor/TH02_V1.1.pdf
-	 */
-	private synchronized float readTemperature() throws IOException {
-		float temperature;
-		// Set START (D0) and TEMP (D4) in CONFIG (register 0x03) to begin a
-		// new conversion, i.e., write CONFIG with 0x11
-		_temperatureSensor.write(0x03, (byte) 0x11);
+    protected void deactivate() {
+        s_logger.info("Deactivating Pi4JGreenhouseSensorService...");
 
-		// Poll RDY (D0) in STATUS (register 0) until it is low (=0)
-		int status = -1;
-		while ((status & 0x01) != 0) {
-			status = _temperatureSensor.read(0x00);
-		}
+        if (_gpioController != null) {
+            s_logger.info("... unexport all GPIOs");
+            _gpioController.unexportAll();
+            s_logger.info("... shutdown");
+            _gpioController.shutdown();
+            s_logger.info("... DONE.");
+        }
 
-		// Read the upper and lower bytes of the temperature value from
-		// DATAh and DATAl (registers 0x01 and 0x02), respectively
-		byte[] buffer = new byte[3];
-		_temperatureSensor.read(buffer, 0, 3);
+        if (_handle != null) {
+            _handle.cancel(true);
+        }
 
-		int dataH = buffer[1] & 0xff;
-		int dataL = buffer[2] & 0xff;
-		
-		// s_logger.info("I2C: [{}, {}]", new Object[] {dataH, dataL} );
+        if (_handleUmidity != null) {
+            _handleUmidity.cancel(true);
+        }
 
-		temperature = (dataH * 256 + dataL) >> 2;
-		temperature = (temperature / 32f) - 50f;
+        s_logger.info("Deactivating Pi4JGreenhouseSensorService... Done.");
+    }
 
-		// s_logger.info("Temperature: {}", temperature);
-		
-		// truncate to 2 decimals
-		DecimalFormat twoDForm = new DecimalFormat("#.##");
-		return Float.valueOf(twoDForm.format(temperature));
-	}
+    @Override
+    public Object getSensorValue(String sensorName) throws NoSuchSensorOrActuatorException {
 
-	private boolean readLightState() {
-		return _lightActuator.getState().isHigh();
-	}
+        if ("temperature".equals(sensorName)) {
+            try {
+                return readTemperature();
+            } catch (IOException e) {
+                return new NoSuchSensorOrActuatorException();
+            }
+        } else if ("umidity".equals(sensorName)) {
+            try {
+                return readUmidity();
+            } catch (IOException e) {
+                return new NoSuchSensorOrActuatorException();
+            }
+        } else if ("light".equals(sensorName)) {
+            return readLightState();
+        } else
+            throw new SensorService.NoSuchSensorOrActuatorException();
+    }
 
-	@Override
-	public void setActuatorValue(String actuatorName, Object value)
-			throws NoSuchSensorOrActuatorException {
-		if ("light".equals(actuatorName)) {
-			_lightActuator.setState("on".equals(value));
-			notifyListeners("light", value);
-		} else {
-			throw new SensorService.NoSuchSensorOrActuatorException();
-		}
-	}
+    /*
+     * See sensor documentation here:
+     * http://www.hoperf.cn/upload/sensor/TH02_V1.1.pdf
+     */
+    private synchronized float readTemperature() throws IOException {
+        float temperature;
+        // Set START (D0) and TEMP (D4) in CONFIG (register 0x03) to begin a
+        // new conversion, i.e., write CONFIG with 0x11
+        _temperatureSensor.write(0x03, (byte) 0x11);
 
-	public void addSensorChangedListener(SensorChangedListener listener) {
-		_listeners.add(listener);
-	}
+        // Poll RDY (D0) in STATUS (register 0) until it is low (=0)
+        int status = -1;
+        while ((status & 0x01) != 0) {
+            status = _temperatureSensor.read(0x00);
+        }
 
-	public void removeSensorChangedListener(SensorChangedListener listener) {
-		_listeners.remove(listener);
-	}
+        // Read the upper and lower bytes of the temperature value from
+        // DATAh and DATAl (registers 0x01 and 0x02), respectively
+        byte[] buffer = new byte[3];
+        _temperatureSensor.read(buffer, 0, 3);
 
-	private void notifyListeners(String sensorName, Object newValue) {
-		for (SensorChangedListener listener : _listeners) {
-			listener.sensorChanged(sensorName, newValue);
-		}
-	}
+        int dataH = buffer[1] & 0xff;
+        int dataL = buffer[2] & 0xff;
+
+        // s_logger.info("I2C: [{}, {}]", new Object[] {dataH, dataL} );
+
+        temperature = (dataH * 256 + dataL) >> 2;
+        temperature = (temperature / 32f) - 50f;
+
+        // s_logger.info("Temperature: {}", temperature);
+
+        // truncate to 2 decimals
+        DecimalFormat twoDForm = new DecimalFormat("#.##");
+        return Float.valueOf(twoDForm.format(temperature));
+    }
+
+    private synchronized float readUmidity() throws IOException {
+        float umidity;
+        _umiditySensor.write(0x03, (byte) 0x01);
+
+        int status = -1;
+        while ((status & 0x01) != 0) {
+            status = _umiditySensor.read(0x00);
+        }
+
+        byte[] buffer = new byte[3];
+        _umiditySensor.read(buffer, 0, 3);
+
+        int dataH = buffer[1] & 0xff;
+        int dataL = buffer[2] & 0xff;
+
+        umidity = (dataH * 256 + dataL) >> 4;
+        umidity = (umidity / 16f) - 24f;
+
+        DecimalFormat twoDForm = new DecimalFormat("#.##");
+
+        return Float.valueOf(twoDForm.format(umidity));
+    }
+
+    private boolean readLightState() {
+        return _lightActuator.getState().isHigh();
+    }
+
+    @Override
+    public void setActuatorValue(String actuatorName, Object value) throws NoSuchSensorOrActuatorException {
+        if ("light".equals(actuatorName)) {
+            _lightActuator.setState("on".equals(value));
+            notifyListeners("light", value);
+        } else {
+            throw new SensorService.NoSuchSensorOrActuatorException();
+        }
+    }
+
+    public void addSensorChangedListener(SensorChangedListener listener) {
+        _listeners.add(listener);
+    }
+
+    public void removeSensorChangedListener(SensorChangedListener listener) {
+        _listeners.remove(listener);
+    }
+
+    private void notifyListeners(String sensorName, Object newValue) {
+        for (SensorChangedListener listener : _listeners) {
+            listener.sensorChanged(sensorName, newValue);
+        }
+    }
 
 }
